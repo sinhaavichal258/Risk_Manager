@@ -27,7 +27,7 @@ def load_data(file):
     return df
 
 
-st.title("BRN D-Fly Risk Manager")
+st.title(" Risk Manager")
 st.caption(
     "Stop-loss dollar risk and Pearson-correlation-adjusted portfolio risk "
     "across ICE Brent generic double-fly spreads."
