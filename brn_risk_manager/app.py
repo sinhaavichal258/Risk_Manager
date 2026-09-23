@@ -372,3 +372,120 @@ with st.expander("Show risk vector R and full leg-level correlation matrix C"):
         pd.DataFrame(C, index=legs_flies, columns=legs_flies).style.format("{:.2f}"),
         use_container_width=True,
     )
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# 3. Monte Carlo VaR
+# ---------------------------------------------------------------------------
+st.header("3. Monte Carlo VaR")
+st.caption(
+    "Uses the same signed $ risk vector R and EWMA-adjusted correlation "
+    "matrix C from Section 2. Draws independent shocks per leg from your "
+    "chosen distribution, correlates them via a Cholesky decomposition of C, "
+    "then prices each simulated draw against R to build a simulated $ P&L "
+    "distribution: L = cholesky(C); simulated_returns = L @ draws; "
+    "simulated_pnl = Rᵀ @ simulated_returns. VaR is read off as a percentile "
+    "of that distribution."
+)
+
+
+def nearest_psd_correlation(mat: np.ndarray) -> np.ndarray:
+    """Project a matrix onto the nearest valid (positive semi-definite)
+    correlation matrix so Cholesky always succeeds, even if the pairwise
+    EWMA-built matrix isn't exactly PSD."""
+    sym = (mat + mat.T) / 2
+    eigvals, eigvecs = np.linalg.eigh(sym)
+    eigvals = np.clip(eigvals, 1e-10, None)
+    psd = eigvecs @ np.diag(eigvals) @ eigvecs.T
+    d = np.sqrt(np.diag(psd))
+    d[d == 0] = 1e-10
+    psd = psd / np.outer(d, d)
+    np.fill_diagonal(psd, 1.0)
+    return psd
+
+
+mc1, mc2, mc3 = st.columns(3)
+n_sims = mc1.number_input("Number of simulations", min_value=1000, max_value=200000, value=20000, step=1000)
+confidence = mc2.slider("Confidence level (%)", min_value=90, max_value=99, value=95, step=1)
+dist_choice = mc3.selectbox("Shock distribution", ["Normal", "Uniform"])
+
+if dist_choice == "Normal":
+    nd1, nd2 = st.columns(2)
+    dist_mean = nd1.number_input("Mean", value=0.0, step=0.1, format="%.3f")
+    dist_std = nd2.number_input("Standard deviation", value=1.0, min_value=0.0001, step=0.1, format="%.3f")
+else:
+    ud1, ud2 = st.columns(2)
+    dist_lo = ud1.number_input("Uniform min", value=-1.0, step=0.1, format="%.3f")
+    dist_hi = ud2.number_input("Uniform max", value=1.0, step=0.1, format="%.3f")
+    if dist_hi <= dist_lo:
+        st.error("Uniform max must be greater than uniform min.")
+        st.stop()
+
+sc1, sc2 = st.columns([1, 2])
+fix_seed = sc1.checkbox("Fix random seed", value=True, help="Same seed = reproducible simulation on rerun.")
+seed_val = sc2.number_input("Seed", value=42, step=1, disabled=not fix_seed)
+
+C_psd = nearest_psd_correlation(C)
+adj_norm = float(np.linalg.norm(C_psd - C))
+if adj_norm > 1e-6:
+    st.caption(
+        "⚠️ The EWMA-built correlation matrix wasn't exactly a valid "
+        "(positive semi-definite) correlation matrix, so it was projected "
+        "onto the nearest valid one before running the simulation "
+        f"(adjustment size: {adj_norm:.4f})."
+    )
+
+L = np.linalg.cholesky(C_psd)
+
+rng = np.random.default_rng(int(seed_val) if fix_seed else None)
+n_legs = len(legs_flies)
+if dist_choice == "Normal":
+    draws = rng.normal(loc=dist_mean, scale=dist_std, size=(int(n_sims), n_legs))
+else:
+    draws = rng.uniform(low=dist_lo, high=dist_hi, size=(int(n_sims), n_legs))
+
+# simulated_returns = L @ draws (per draw) -> vectorized as draws @ L.T
+simulated_returns = draws @ L.T
+simulated_pnl = simulated_returns @ R.flatten()
+
+var_percentile = 100 - confidence
+var_value = float(np.percentile(simulated_pnl, var_percentile))
+cvar_value = float(simulated_pnl[simulated_pnl <= var_value].mean()) if np.any(simulated_pnl <= var_value) else var_value
+
+v1, v2, v3, v4 = st.columns(4)
+v1.metric("Simulated Mean $ P&L", f"${simulated_pnl.mean():,.0f}")
+v2.metric(f"Monte Carlo VaR ({confidence}%)", f"${abs(var_value):,.0f}")
+v3.metric(f"Expected Shortfall (CVaR, {confidence}%)", f"${abs(cvar_value):,.0f}")
+v4.metric("Worst Simulated $ P&L", f"${simulated_pnl.min():,.0f}")
+
+st.caption(
+    f"VaR reads as: over {int(n_sims):,} simulated scenarios using your "
+    f"{dist_choice.lower()} shocks correlated via C, there's a {var_percentile}% "
+    f"chance of a loss at least this large. Expected Shortfall is the average "
+    f"loss across just the scenarios beyond that VaR threshold — a view of "
+    f"how bad the tail gets, not just where it starts."
+)
+
+hist_fig = px.histogram(
+    simulated_pnl,
+    nbins=80,
+    labels={"value": "Simulated $ P&L"},
+    title="Simulated Portfolio P&L Distribution",
+)
+hist_fig.add_vline(
+    x=var_value,
+    line_dash="dash",
+    line_color="red",
+    annotation_text=f"VaR ({confidence}%): ${var_value:,.0f}",
+    annotation_position="top",
+)
+hist_fig.update_layout(showlegend=False, height=420)
+st.plotly_chart(hist_fig, use_container_width=True)
+
+with st.expander("Show Cholesky factor L used for correlating the shocks"):
+    st.dataframe(
+        pd.DataFrame(L, index=legs_flies, columns=legs_flies).style.format("{:.3f}"),
+        use_container_width=True,
+    )
+    st.caption("L is the lower-triangular Cholesky factor such that L @ Lᵀ = C.")
