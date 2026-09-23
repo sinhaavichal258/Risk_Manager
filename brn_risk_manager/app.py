@@ -202,7 +202,7 @@ with dc2:
     )
 with dc3:
     lam = st.slider(
-        "EWMA decay (λ)", min_value=0.80, max_value=0.99, value=0.94, step=0.01,
+        "EWMA decay (λ)", min_value=0.60, max_value=0.99, value=0.94, step=0.01,
         help="Higher λ = slower decay = older rolling-correlation values still "
              "carry meaningful weight. RiskMetrics standard is 0.94.",
     )
