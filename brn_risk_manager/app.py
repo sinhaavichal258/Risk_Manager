@@ -73,6 +73,8 @@ st.caption(
     "Use the ⋮ menu on a row, or the + at the bottom, to add / delete rows."
 )
 
+POSITIONS_FILE = Path(__file__).parent / "saved_positions.csv"
+
 DEFAULT_POSITIONS = pd.DataFrame(
     [
         {
@@ -86,6 +88,19 @@ DEFAULT_POSITIONS = pd.DataFrame(
     ]
 )
 
+# Seed the editor from a previously-saved file if one exists (so positions
+# survive an app restart), falling back to the built-in default otherwise.
+# `positions_seed` is only ever used to seed the widget — never written back
+# to from `edited` — for the same reason described in the note below.
+if "positions_seed" not in st.session_state:
+    if POSITIONS_FILE.exists():
+        try:
+            st.session_state.positions_seed = pd.read_csv(POSITIONS_FILE)
+        except Exception:
+            st.session_state.positions_seed = DEFAULT_POSITIONS
+    else:
+        st.session_state.positions_seed = DEFAULT_POSITIONS
+
 # NOTE: `value` is only used to seed the editor the very first time it runs
 # for this `key`. After that, st.data_editor tracks all edits internally
 # under st.session_state["positions_editor"] — do NOT also copy its output
@@ -93,7 +108,7 @@ DEFAULT_POSITIONS = pd.DataFrame(
 # `value`. Doing so creates a one-rerun lag where every edit needs to be
 # entered twice before it registers.
 edited = st.data_editor(
-    DEFAULT_POSITIONS,
+    st.session_state.positions_seed,
     num_rows="dynamic",
     use_container_width=True,
     column_config={
@@ -119,7 +134,64 @@ edited = st.data_editor(
     key="positions_editor",
 )
 
+# --- Save / load positions (free, local — a CSV file next to the app) -----
 required_cols = ["Fly", "Entry", "Stop", "Lots (+long/-short)", "Tick Size", "Tick Value ($)"]
+
+with st.sidebar:
+    st.header("Save / Load Positions")
+    sv1, sv2 = st.columns(2)
+    if sv1.button("💾 Save"):
+        edited.to_csv(POSITIONS_FILE, index=False)
+        st.success(f"Saved {len(edited)} position(s).")
+    if sv2.button("🗑️ Clear saved"):
+        if POSITIONS_FILE.exists():
+            POSITIONS_FILE.unlink()
+        st.success("Saved file cleared (current table is unaffected).")
+
+    st.download_button(
+        "⬇️ Download positions as CSV",
+        data=edited.to_csv(index=False),
+        file_name="positions.csv",
+        mime="text/csv",
+        help="Grab a copy you can keep, email, or load into another machine.",
+    )
+
+    upload = st.file_uploader(
+        "⬆️ Load positions from CSV", type=["csv"], key="positions_csv_upload"
+    )
+    if upload is not None:
+        file_sig = (upload.name, upload.size)
+        if st.session_state.get("_last_loaded_positions_sig") != file_sig:
+            try:
+                loaded_df = pd.read_csv(upload)
+                missing_cols = [c for c in required_cols if c not in loaded_df.columns]
+                bad_flies = (
+                    sorted(set(loaded_df["Fly"].dropna()) - set(fly_cols))
+                    if "Fly" in loaded_df.columns else []
+                )
+                if missing_cols:
+                    st.error(f"CSV is missing column(s): {', '.join(missing_cols)}")
+                else:
+                    if bad_flies:
+                        st.warning(
+                            f"Dropping row(s) with unrecognized D-fly name(s): "
+                            f"{', '.join(bad_flies)}"
+                        )
+                        loaded_df = loaded_df[loaded_df["Fly"].isin(fly_cols)]
+                    st.session_state.positions_seed = loaded_df
+                    st.session_state["_last_loaded_positions_sig"] = file_sig
+                    if "positions_editor" in st.session_state:
+                        del st.session_state["positions_editor"]
+                    st.success(f"Loaded {len(loaded_df)} position(s).")
+                    st.rerun()
+            except Exception as e:
+                st.error(f"Couldn't read that CSV: {e}")
+
+    if POSITIONS_FILE.exists():
+        st.caption(f"Last saved file on disk: {POSITIONS_FILE.name}")
+    else:
+        st.caption("No saved file yet — click Save to create one.")
+
 positions = edited.dropna(subset=required_cols).copy()
 positions = positions[positions["Lots (+long/-short)"] != 0]
 positions = positions[positions["Tick Size"] != 0]
@@ -127,6 +199,7 @@ positions = positions[positions["Tick Size"] != 0]
 incomplete = len(edited) - len(edited.dropna(subset=required_cols))
 if incomplete > 0:
     st.caption(f"{incomplete} row(s) still have a blank field and are excluded until filled in.")
+
 
 if positions.empty:
     st.info("Add at least one complete position above to see risk figures.")
