@@ -1,8 +1,13 @@
 """
-BRN D-Fly Risk Manager
------------------------
-A local Streamlit app for stop-loss risk and Pearson-correlation-adjusted
-portfolio risk across ICE Brent generic double-fly (D-fly) spreads.
+Curve Risk Manager
+------------------
+A local Streamlit app for stop-loss risk, EWMA-weighted
+Pearson-correlation-adjusted portfolio risk, Monte Carlo VaR,
+and Historical Simulation VaR.
+
+The same calculations can be run against either bundled dataset:
+- BRN_D_Flies_2018_2026.xlsx
+- CL_BZ_Flybox.xlsx
 
 Run with:
     streamlit run app.py
@@ -14,66 +19,114 @@ import plotly.express as px
 import streamlit as st
 from pathlib import Path
 
-st.set_page_config(page_title="BRN D-Fly Risk Manager", layout="wide")
+st.set_page_config(page_title="Risk Manager", layout="wide")
 
-DATA_FILE = Path(__file__).parent / "BRN_D_Flies_2018_2026.xlsx"
+APP_DIR = Path(__file__).parent
+
+DATASETS = {
+    "BRN D-Flies": {
+        "id": "brn_d_flies",
+        "file": APP_DIR / "BRN_D_Flies_2018_2026.xlsx",
+        "position_file": APP_DIR / "saved_positions.csv",  # preserve existing BRN file
+        "fly_label": "Generic D-Fly",
+        "caption": "ICE Brent generic double-fly (D-fly) spreads.",
+    },
+    "CL/BZ Flybox": {
+        "id": "cl_bz_flybox",
+        "file": APP_DIR / "CL_BZ_Flybox.xlsx",
+        "position_file": APP_DIR / "saved_positions_CL_BZ.csv",
+        "fly_label": "CL/BZ Flybox",
+        "caption": "CL/BZ flybox spreads.",
+    },
+}
 
 
 @st.cache_data
 def load_data(file):
     df = pd.read_excel(file, sheet_name=0)
+    if "Date" not in df.columns:
+        raise ValueError("The Excel file must contain a 'Date' column.")
+
     df["Date"] = pd.to_datetime(df["Date"])
     df = df.sort_values("Date").reset_index(drop=True)
+
+    fly_cols = [c for c in df.columns if c != "Date" and not str(c).startswith("Unnamed:")]
+    if not fly_cols:
+        raise ValueError("The Excel file must contain at least one fly-price column besides 'Date'.")
+
     return df
 
 
-st.title(" Risk Manager")
-st.caption(
-    "Stop-loss dollar risk and Pearson-correlation-adjusted portfolio risk "
-    "across ICE Brent generic double-fly spreads."
-)
+# ---------------------------------------------------------------------------
+# Dataset selection / data source
+# ---------------------------------------------------------------------------
+with st.sidebar:
+    st.header("Dataset")
+    selected_dataset = st.selectbox(
+        "Select dataset",
+        list(DATASETS.keys()),
+        index=0,
+        key="dataset_selector",
+    )
 
-# ---------------------------------------------------------------------------
-# Data source
-# ---------------------------------------------------------------------------
+dataset = DATASETS[selected_dataset]
+dataset_id = dataset["id"]
+DATA_FILE = dataset["file"]
+POSITIONS_FILE = dataset["position_file"]
+
 with st.sidebar:
     st.header("Data source")
     uploaded = st.file_uploader(
-        "Upload D-fly data (.xlsx) — optional, overrides the bundled file",
+        f"Upload {selected_dataset} data (.xlsx) — optional, overrides the bundled file",
         type=["xlsx"],
+        key=f"data_upload_{dataset_id}",
     )
     st.caption(
-        "By default the app loads BRN_D_Flies_2018_2026.xlsx from this folder."
+        f"Bundled file: {DATA_FILE.name}"
     )
 
 if uploaded is not None:
-    df = load_data(uploaded)
+    try:
+        df = load_data(uploaded)
+    except Exception as e:
+        st.error(f"Could not read the uploaded Excel file: {e}")
+        st.stop()
 elif DATA_FILE.exists():
-    df = load_data(DATA_FILE)
+    try:
+        df = load_data(DATA_FILE)
+    except Exception as e:
+        st.error(f"Could not read {DATA_FILE.name}: {e}")
+        st.stop()
 else:
-    st.warning("No data file found. Upload the BRN D-fly Excel file in the sidebar.")
+    st.warning(
+        f"{DATA_FILE.name} was not found next to app.py. "
+        "Add the file to your GitHub repository or upload it above."
+    )
     st.stop()
 
-fly_cols = [c for c in df.columns if c != "Date"]
+fly_cols = [c for c in df.columns if c != "Date" and not str(c).startswith("Unnamed:")]
 min_date, max_date = df["Date"].min().date(), df["Date"].max().date()
 
+st.title("Risk Manager")
+st.caption(
+    f"{dataset['caption']} Stop-loss dollar risk and Pearson-correlation-adjusted "
+    f"portfolio risk across the selected dataset: {selected_dataset}."
+)
+
 with st.sidebar:
-    st.header("Dataset")
     st.write(f"**{len(df):,}** rows")
     st.write(f"**{min_date}** → **{max_date}**")
-    st.write(f"**{len(fly_cols)}** generic D-flies")
+    st.write(f"**{len(fly_cols)}** fly series")
 
 # ---------------------------------------------------------------------------
 # 1. Positions
 # ---------------------------------------------------------------------------
 st.header("1. Positions")
 st.caption(
-    "Add one row per position. Pick the generic D-fly from the dropdown, "
+    "Add one row per position. Pick the fly from the dropdown, "
     "set entry/stop and lot size. Lots can be negative for a short. "
     "Use the ⋮ menu on a row, or the + at the bottom, to add / delete rows."
 )
-
-POSITIONS_FILE = Path(__file__).parent / "saved_positions.csv"
 
 DEFAULT_POSITIONS = pd.DataFrame(
     [
@@ -88,32 +141,38 @@ DEFAULT_POSITIONS = pd.DataFrame(
     ]
 )
 
+# Keep position state separate for each dataset so switching between datasets
+# never mixes BRN fly names with CL/BZ fly names.
+positions_seed_key = f"positions_seed_{dataset_id}"
+positions_editor_key = f"positions_editor_{dataset_id}"
+positions_upload_key = f"positions_csv_upload_{dataset_id}"
+last_loaded_sig_key = f"_last_loaded_positions_sig_{dataset_id}"
+
 # Seed the editor from a previously-saved file if one exists (so positions
 # survive an app restart), falling back to the built-in default otherwise.
-# `positions_seed` is only ever used to seed the widget — never written back
-# to from `edited` — for the same reason described in the note below.
-if "positions_seed" not in st.session_state:
+# The seed is only used to initialize the widget; edited data stays inside
+# the data editor session state.
+if positions_seed_key not in st.session_state:
     if POSITIONS_FILE.exists():
         try:
-            st.session_state.positions_seed = pd.read_csv(POSITIONS_FILE)
+            saved = pd.read_csv(POSITIONS_FILE)
+            if "Fly" in saved.columns:
+                saved = saved[saved["Fly"].isin(fly_cols)].copy()
+            st.session_state[positions_seed_key] = (
+                saved if not saved.empty else DEFAULT_POSITIONS
+            )
         except Exception:
-            st.session_state.positions_seed = DEFAULT_POSITIONS
+            st.session_state[positions_seed_key] = DEFAULT_POSITIONS
     else:
-        st.session_state.positions_seed = DEFAULT_POSITIONS
+        st.session_state[positions_seed_key] = DEFAULT_POSITIONS
 
-# NOTE: `value` is only used to seed the editor the very first time it runs
-# for this `key`. After that, st.data_editor tracks all edits internally
-# under st.session_state["positions_editor"] — do NOT also copy its output
-# back into a separate session_state variable and feed that back in as
-# `value`. Doing so creates a one-rerun lag where every edit needs to be
-# entered twice before it registers.
 edited = st.data_editor(
-    st.session_state.positions_seed,
+    st.session_state[positions_seed_key],
     num_rows="dynamic",
     use_container_width=True,
     column_config={
         "Fly": st.column_config.SelectboxColumn(
-            "Generic D-Fly", options=fly_cols, required=True, default=fly_cols[0]
+            dataset["fly_label"], options=fly_cols, required=True, default=fly_cols[0]
         ),
         "Entry": st.column_config.NumberColumn(
             "Entry Price", step=0.01, format="%.3f", default=0.0
@@ -131,7 +190,7 @@ edited = st.data_editor(
             "Tick Value ($)", step=1.0, default=10.0
         ),
     },
-    key="positions_editor",
+    key=positions_editor_key,
 )
 
 # --- Save / load positions (free, local — a CSV file next to the app) -----
@@ -157,11 +216,11 @@ with st.sidebar:
     )
 
     upload = st.file_uploader(
-        "⬆️ Load positions from CSV", type=["csv"], key="positions_csv_upload"
+        "⬆️ Load positions from CSV", type=["csv"], key=positions_upload_key
     )
     if upload is not None:
         file_sig = (upload.name, upload.size)
-        if st.session_state.get("_last_loaded_positions_sig") != file_sig:
+        if st.session_state.get(last_loaded_sig_key) != file_sig:
             try:
                 loaded_df = pd.read_csv(upload)
                 missing_cols = [c for c in required_cols if c not in loaded_df.columns]
@@ -174,14 +233,14 @@ with st.sidebar:
                 else:
                     if bad_flies:
                         st.warning(
-                            f"Dropping row(s) with unrecognized D-fly name(s): "
+                            f"Dropping row(s) with unrecognized fly name(s): "
                             f"{', '.join(bad_flies)}"
                         )
                         loaded_df = loaded_df[loaded_df["Fly"].isin(fly_cols)]
-                    st.session_state.positions_seed = loaded_df
-                    st.session_state["_last_loaded_positions_sig"] = file_sig
-                    if "positions_editor" in st.session_state:
-                        del st.session_state["positions_editor"]
+                    st.session_state[positions_seed_key] = loaded_df
+                    st.session_state[last_loaded_sig_key] = file_sig
+                    if positions_editor_key in st.session_state:
+                        del st.session_state[positions_editor_key]
                     st.success(f"Loaded {len(loaded_df)} position(s).")
                     st.rerun()
             except Exception as e:
@@ -248,7 +307,7 @@ st.divider()
 st.header("2. EWMA-Weighted Correlation-Adjusted Portfolio Risk")
 st.caption(
     "Method: compute a rolling Pearson correlation between each pair of "
-    "D-flies over the lookback period (window length below), then apply "
+    "fly series over the lookback period (window length below), then apply "
     "RiskMetrics-style EWMA smoothing across that rolling series so recent "
     "windows count more than older ones — instead of one flat correlation "
     "over the whole lookback period."
@@ -266,22 +325,25 @@ with dc1:
         value=(max(min_date, max_date - pd.Timedelta(days=90)), max_date),
         min_value=min_date,
         max_value=FAR_FUTURE,
+        key=f"corr_dates_{dataset_id}",
     )
 with dc2:
     window_choice = st.selectbox(
         "Rolling correlation window",
         ["5-day", "10-day", "20-day", "30-day", "60-day", "Custom"],
         index=2,
+        key=f"corr_window_{dataset_id}",
     )
 with dc3:
     lam = st.slider(
         "EWMA decay (λ)", min_value=0.60, max_value=0.99, value=0.94, step=0.01,
         help="Higher λ = slower decay = older rolling-correlation values still "
              "carry meaningful weight. RiskMetrics standard is 0.94.",
+        key=f"corr_lambda_{dataset_id}",
     )
 
 if window_choice == "Custom":
-    window = st.number_input("Custom window length (days)", min_value=2, max_value=250, value=20, step=1)
+    window = st.number_input("Custom window length (days)", min_value=2, max_value=250, value=20, step=1, key=f"custom_window_{dataset_id}")
 else:
     window = int(window_choice.split("-")[0])
 
@@ -389,7 +451,7 @@ st.caption(
     "flies stack up toward the naive sum."
 )
 
-with st.expander("Show EWMA-adjusted correlation matrix (unique D-flies in this portfolio)"):
+with st.expander("Show EWMA-adjusted correlation matrix (unique fly series in this portfolio)"):
     fig = px.imshow(
         corr_unique,
         text_auto=".2f",
@@ -408,13 +470,13 @@ with st.expander("Show EWMA-adjusted correlation matrix (unique D-flies in this 
 
 with st.expander("Show rolling correlation history for a pair"):
     if len(unique_flies) < 2:
-        st.write("Add positions in at least two different D-flies to see a pair.")
+        st.write("Add positions in at least two different fly series to see a pair.")
     else:
         pc1, pc2 = st.columns(2)
-        fly_a = pc1.selectbox("Fly A", unique_flies, index=0, key="pair_a")
-        fly_b = pc2.selectbox("Fly B", unique_flies, index=min(1, len(unique_flies) - 1), key="pair_b")
+        fly_a = pc1.selectbox("Fly A", unique_flies, index=0, key=f"pair_a_{dataset_id}")
+        fly_b = pc2.selectbox("Fly B", unique_flies, index=min(1, len(unique_flies) - 1), key=f"pair_b_{dataset_id}")
         if fly_a == fly_b:
-            st.write("Pick two different D-flies.")
+            st.write("Pick two different fly series.")
         else:
             key = (fly_a, fly_b) if (fly_a, fly_b) in rolling_series else (fly_b, fly_a)
             roll = rolling_series.get(key)
@@ -568,7 +630,7 @@ st.divider()
 # ---------------------------------------------------------------------------
 # 4. Historical Simulation VaR
 # ---------------------------------------------------------------------------
-st.header("4. Historical Simulation P&L")
+st.header("4. Historical Simulation VaR")
 st.caption(
     "No distribution assumed — replays actual historical daily price moves "
     "through your current positions. For each day in the chosen range: "
@@ -583,7 +645,7 @@ hist_mode = st.radio(
     "Date range to use",
     ["Use full dataset", "Custom date range"],
     horizontal=True,
-    key="hist_var_mode",
+    key=f"hist_var_mode_{dataset_id}",
 )
 
 if hist_mode == "Custom date range":
@@ -592,7 +654,7 @@ if hist_mode == "Custom date range":
         value=(min_date, max_date),
         min_value=min_date,
         max_value=FAR_FUTURE,
-        key="hist_var_dates",
+        key=f"hist_var_dates_{dataset_id}",
     )
     if len(hist_date_range) != 2:
         st.info("Pick both a start and an end date.")
@@ -620,7 +682,7 @@ else:
 
 hist_confidence = st.slider(
     "Confidence level (%)", min_value=90, max_value=99, value=95, step=1,
-    key="hist_var_confidence",
+    key=f"hist_var_confidence_{dataset_id}",
 )
 
 hist_window = df[
