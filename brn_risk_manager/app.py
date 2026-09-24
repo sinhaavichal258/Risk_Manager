@@ -562,3 +562,143 @@ with st.expander("Show Cholesky factor L used for correlating the shocks"):
         use_container_width=True,
     )
     st.caption("L is the lower-triangular Cholesky factor such that L @ Lᵀ = C.")
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# 4. Historical Simulation VaR
+# ---------------------------------------------------------------------------
+st.header("4. Historical Simulation VaR")
+st.caption(
+    "No distribution assumed — replays actual historical daily price moves "
+    "through your current positions. For each day in the chosen range: "
+    "daily $ P&L = Σᵢ (lotsᵢ × daily price changeᵢ, converted to dollars via "
+    "each leg's tick size/tick value). VaR is the chosen percentile of that "
+    "daily $ P&L distribution — e.g. 95% VaR is the 5th percentile, the loss "
+    "level exceeded on only 5% of historical days for the book you have on "
+    "right now."
+)
+
+hist_mode = st.radio(
+    "Date range to use",
+    ["Use full dataset", "Custom date range"],
+    horizontal=True,
+    key="hist_var_mode",
+)
+
+if hist_mode == "Custom date range":
+    hist_date_range = st.date_input(
+        "Historical VaR date range (start, end)",
+        value=(min_date, max_date),
+        min_value=min_date,
+        max_value=FAR_FUTURE,
+        key="hist_var_dates",
+    )
+    if len(hist_date_range) != 2:
+        st.info("Pick both a start and an end date.")
+        st.stop()
+    hist_start_date, hist_end_date = hist_date_range
+
+    hist_problem = None
+    if hist_start_date < min_date:
+        hist_problem = f"{hist_start_date} is not available — data starts {min_date}."
+    elif hist_start_date > max_date:
+        hist_problem = f"{hist_start_date} is not available — data only runs through {max_date}."
+    elif hist_end_date > max_date:
+        hist_problem = f"{hist_end_date} is not available — data only runs through {max_date}."
+    elif hist_end_date < min_date:
+        hist_problem = f"{hist_end_date} is not available — data starts {min_date}."
+
+    if hist_problem:
+        st.error(f"⚠️ {hist_problem} Pick a date within {min_date} → {max_date}.")
+        st.stop()
+    if hist_start_date >= hist_end_date:
+        st.error("Start date must be before end date.")
+        st.stop()
+else:
+    hist_start_date, hist_end_date = min_date, max_date
+
+hist_confidence = st.slider(
+    "Confidence level (%)", min_value=90, max_value=99, value=95, step=1,
+    key="hist_var_confidence",
+)
+
+hist_window = df[
+    (df["Date"].dt.date >= hist_start_date) & (df["Date"].dt.date <= hist_end_date)
+].sort_values("Date").reset_index(drop=True)
+
+portfolio_daily_pnl = pd.Series(0.0, index=hist_window.index)
+for _, row in positions.iterrows():
+    fly = row["Fly"]
+    lots = row["Lots (+long/-short)"]
+    tick_size = row["Tick Size"]
+    tick_value = row["Tick Value ($)"]
+    price_change = hist_window[fly].diff()
+    dollar_change_per_lot = price_change / tick_size * tick_value
+    portfolio_daily_pnl = portfolio_daily_pnl.add(lots * dollar_change_per_lot, fill_value=0.0)
+
+portfolio_daily_pnl.index = hist_window["Date"]
+portfolio_daily_pnl = portfolio_daily_pnl.dropna()
+
+if len(portfolio_daily_pnl) < 5:
+    st.warning(
+        f"Only {len(portfolio_daily_pnl)} usable trading day(s) of daily "
+        f"P&L in {hist_start_date} → {hist_end_date} — too few for a "
+        f"meaningful historical VaR. Widen the date range."
+    )
+else:
+    hist_var_pct = 100 - hist_confidence
+    hist_var_value = float(np.percentile(portfolio_daily_pnl.to_numpy(), hist_var_pct))
+    tail = portfolio_daily_pnl[portfolio_daily_pnl <= hist_var_value]
+    hist_cvar_value = float(tail.mean()) if len(tail) > 0 else hist_var_value
+    worst_date = portfolio_daily_pnl.idxmin()
+    worst_pnl = float(portfolio_daily_pnl.min())
+
+    h1, h2, h3, h4 = st.columns(4)
+    h1.metric("Trading Days Used", f"{len(portfolio_daily_pnl):,}")
+    h2.metric(f"Historical VaR ({hist_confidence}%)", f"${abs(hist_var_value):,.0f}")
+    h3.metric(f"Historical Expected Shortfall ({hist_confidence}%)", f"${abs(hist_cvar_value):,.0f}")
+    h4.metric("Worst Historical Day", f"${worst_pnl:,.0f}")
+
+    st.caption(
+        f"Worst single day for this exact book of positions was "
+        f"{worst_date.date()}, at ${worst_pnl:,.0f}. VaR reads as: over "
+        f"{hist_start_date} → {hist_end_date} ({len(portfolio_daily_pnl):,} "
+        f"trading days), {hist_var_pct}% of days saw a loss at least this "
+        f"large for your current positions. Expected Shortfall is the "
+        f"average loss across just the days beyond that VaR threshold."
+    )
+
+    hist_hist_fig = px.histogram(
+        portfolio_daily_pnl,
+        nbins=min(80, max(10, len(portfolio_daily_pnl) // 3)),
+        labels={"value": "Daily $ P&L"},
+        title="Historical Daily P&L Distribution (current positions replayed through history)",
+    )
+    hist_hist_fig.add_vline(
+        x=hist_var_value,
+        line_dash="dash",
+        line_color="red",
+        annotation_text=f"VaR ({hist_confidence}%): ${hist_var_value:,.0f}",
+        annotation_position="top",
+    )
+    hist_hist_fig.update_layout(showlegend=False, height=420)
+    st.plotly_chart(hist_hist_fig, use_container_width=True)
+
+    with st.expander("Show daily $ P&L time series"):
+        st.line_chart(portfolio_daily_pnl)
+        st.caption(
+            "Daily $ P&L your current position sizes would have produced on "
+            "each historical day, given actual price moves — not a "
+            "simulation, this replays what really happened."
+        )
+
+    with st.expander("Show daily $ P&L table"):
+        pnl_table = portfolio_daily_pnl.reset_index()
+        pnl_table.columns = ["Date", "Daily $ P&L"]
+        st.dataframe(
+            pnl_table.sort_values("Date", ascending=False)
+            .style.format({"Daily $ P&L": "${:,.0f}"}),
+            use_container_width=True,
+            height=300,
+        )
