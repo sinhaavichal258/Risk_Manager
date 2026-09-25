@@ -688,7 +688,7 @@ st.divider()
 # ---------------------------------------------------------------------------
 # 4. Historical Simulation VaR
 # ---------------------------------------------------------------------------
-st.header("4. Historical Simulation VaR")
+st.header("4. Historical Simulation P&L")
 st.caption(
     "No distribution assumed — replays actual historical daily price moves "
     "through your current positions. For each day in the chosen range: "
