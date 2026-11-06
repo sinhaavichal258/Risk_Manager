@@ -5,9 +5,10 @@ A local Streamlit app for stop-loss risk, EWMA-weighted
 Pearson-correlation-adjusted portfolio risk, Monte Carlo VaR,
 and Historical Simulation VaR.
 
-The same calculations can be run against either bundled dataset:
+The same calculations can be run against any bundled dataset:
 - BRN_D_Flies_2018_2026.xlsx
 - CL_BZ_Flybox.xlsx
+- CL_D_Flies_2018_2026.xlsx
 
 Run with:
     streamlit run app.py
@@ -37,6 +38,13 @@ DATASETS = {
         "position_file": APP_DIR / "saved_positions_CL_BZ.csv",
         "fly_label": "CL/BZ Flybox",
         "caption": "CL/BZ flybox spreads.",
+    },
+    "CL D-Flies": {
+        "id": "cl_d_flies",
+        "file": APP_DIR / "CL_D_Flies_2018_2026.xlsx",
+        "position_file": APP_DIR / "saved_positions_CL_D.csv",
+        "fly_label": "Generic CL D-Fly",
+        "caption": "NYMEX WTI (CL) generic double-fly (D-fly) spreads.",
     },
 }
 
@@ -251,6 +259,8 @@ with st.sidebar:
     download_name = (
         "BRN_D_Flies_positions.csv"
         if dataset_id == "brn_d_flies"
+        else "CL_D_Flies_positions.csv"
+        if dataset_id == "cl_d_flies"
         else "CL_BZ_Flybox_positions.csv"
     )
 
@@ -433,6 +443,13 @@ window_data = df[(df["Date"].dt.date >= start_date) & (df["Date"].dt.date <= end
 
 legs_flies = positions["Fly"].tolist()
 unique_flies = sorted(set(legs_flies))
+# Display-only labels: if the same fly appears in more than one position row,
+# tag each row with its position number so table row/column labels stay unique
+# (pandas Styler cannot render duplicate labels). Calculations use legs_flies.
+leg_labels = [
+    f"{f} (#{i + 1})" if legs_flies.count(f) > 1 else f
+    for i, f in enumerate(legs_flies)
+]
 
 min_needed = window + 2
 if len(window_data) < min_needed:
@@ -556,13 +573,13 @@ with st.expander("Show risk vector R and full leg-level correlation matrix C"):
     st.write("**R — signed $ risk per position**")
     st.dataframe(
         pd.DataFrame(
-            {"Fly": legs_flies, "Signed $ Risk": R.flatten()}
+            {"Fly": leg_labels, "Signed $ Risk": R.flatten()}
         ).style.format({"Signed $ Risk": "${:,.0f}"}),
         use_container_width=True,
     )
     st.write("**C — position-level EWMA-adjusted correlation matrix**")
     st.dataframe(
-        pd.DataFrame(C, index=legs_flies, columns=legs_flies).style.format("{:.2f}"),
+        pd.DataFrame(C, index=leg_labels, columns=leg_labels).style.format("{:.2f}"),
         use_container_width=True,
     )
 
@@ -678,7 +695,7 @@ st.plotly_chart(hist_fig, use_container_width=True)
 
 with st.expander("Show Cholesky factor L used for correlating the shocks"):
     st.dataframe(
-        pd.DataFrame(L, index=legs_flies, columns=legs_flies).style.format("{:.3f}"),
+        pd.DataFrame(L, index=leg_labels, columns=leg_labels).style.format("{:.3f}"),
         use_container_width=True,
     )
     st.caption("L is the lower-triangular Cholesky factor such that L @ Lᵀ = C.")
