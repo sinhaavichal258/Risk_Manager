@@ -10,6 +10,9 @@ The same calculations can be run against any bundled dataset:
 - CL_BZ_Flybox.xlsx
 - CL_D_Flies_2018_2026.xlsx
 
+An "Overall Portfolio" view combines the positions of all three datasets and
+runs the same calculations on one full correlation matrix across every position.
+
 Run with:
     streamlit run app.py
 """
@@ -46,7 +49,21 @@ DATASETS = {
         "fly_label": "Generic CL D-Fly",
         "caption": "NYMEX WTI (CL) generic double-fly (D-fly) spreads.",
     },
+    "Overall Portfolio": {
+        "id": "overall_portfolio",
+        "portfolio": True,  # combines every dataset above; positions are read-only here
+        "file": None,
+        "position_file": None,
+        "fly_label": "Fly",
+        "caption": (
+            "All positions from BRN D-Flies, CL/BZ Flybox and CL D-Flies combined, "
+            "with correlations computed across all three datasets on their common "
+            "trading dates."
+        ),
+    },
 }
+
+required_cols = ["Fly", "Entry", "Stop", "Lots (+long/-short)", "Tick Size", "Tick Value ($)"]
 
 
 @st.cache_data
@@ -65,6 +82,40 @@ def load_data(file):
     return df
 
 
+def get_dataset_positions(dataset_name):
+    """Latest known positions for one dataset (used by the Overall Portfolio).
+
+    Order: positions last shown in that dataset's editor this session ->
+    positions saved this session -> saved CSV beside app.py -> nothing.
+    """
+    ds = DATASETS[dataset_name]
+    ds_id = ds["id"]
+    live = st.session_state.get(f"live_positions_{ds_id}")
+    if live is not None:
+        return live.copy(), "editor (as last viewed this session)"
+    saved = st.session_state.get(f"saved_positions_{ds_id}")
+    if saved is not None:
+        return saved.copy(), "saved this session"
+    if ds["position_file"] is not None and ds["position_file"].exists():
+        try:
+            return pd.read_csv(ds["position_file"]), f"saved file ({ds['position_file'].name})"
+        except Exception:
+            pass
+    return None, "none found"
+
+
+def clean_dataset_positions(raw, valid_flies):
+    """Same completeness filters as Section 1, plus: a row with Entry = Stop = 0
+    is the untouched starter row and is skipped."""
+    if raw is None or raw.empty or any(c not in raw.columns for c in required_cols):
+        return pd.DataFrame(columns=required_cols)
+    p = raw[raw["Fly"].isin(valid_flies)].dropna(subset=required_cols).copy()
+    p = p[p["Lots (+long/-short)"] != 0]
+    p = p[p["Tick Size"] != 0]
+    p = p[~((p["Entry"] == 0) & (p["Stop"] == 0))]
+    return p[required_cols]
+
+
 # ---------------------------------------------------------------------------
 # Dataset selection / data source
 # ---------------------------------------------------------------------------
@@ -79,21 +130,96 @@ with st.sidebar:
 
 dataset = DATASETS[selected_dataset]
 dataset_id = dataset["id"]
+IS_PORTFOLIO = dataset.get("portfolio", False)
 DATA_FILE = dataset["file"]
 POSITIONS_FILE = dataset["position_file"]
 
 with st.sidebar:
     st.header("Data source")
-    uploaded = st.file_uploader(
-        f"Upload {selected_dataset} data (.xlsx) — optional, overrides the bundled file",
-        type=["xlsx"],
-        key=f"data_upload_{dataset_id}",
-    )
-    st.caption(
-        f"Bundled file: {DATA_FILE.name}"
+    if IS_PORTFOLIO:
+        uploaded = None
+        st.caption(
+            "Overall Portfolio uses the bundled data files of the three datasets, "
+            "aligned on their common trading dates."
+        )
+    else:
+        uploaded = st.file_uploader(
+            f"Upload {selected_dataset} data (.xlsx) — optional, overrides the bundled file",
+            type=["xlsx"],
+            key=f"data_upload_{dataset_id}",
+        )
+        st.caption(
+            f"Bundled file: {DATA_FILE.name}"
+        )
+
+if IS_PORTFOLIO:
+    # Overall Portfolio: gather every dataset's positions and align the datasets'
+    # series on common trading dates so one full correlation matrix can be built
+    # across all positions.
+    portfolio_frames = {}
+    for _name, _ds in DATASETS.items():
+        if _ds.get("portfolio"):
+            continue
+        if not _ds["file"].exists():
+            st.warning(
+                f"{_ds['file'].name} was not found next to app.py. "
+                "The Overall Portfolio needs all three bundled data files."
+            )
+            st.stop()
+        try:
+            _frame = load_data(_ds["file"])
+        except Exception as e:
+            st.error(f"Could not read {_ds['file'].name}: {e}")
+            st.stop()
+        portfolio_frames[_name] = _frame[
+            [c for c in _frame.columns if c == "Date" or not str(c).startswith("Unnamed:")]
+        ]
+
+    portfolio_rows, portfolio_sources = [], []
+    for _name, _frame in portfolio_frames.items():
+        _raw, _source = get_dataset_positions(_name)
+        _clean = clean_dataset_positions(_raw, set(_frame.columns) - {"Date"})
+        if not _clean.empty:
+            _clean = _clean.copy()
+            _clean.insert(0, "Dataset", _name)
+            portfolio_rows.append(_clean)
+        portfolio_sources.append(
+            {"Dataset": _name, "Positions included": len(_clean), "Source": _source}
+        )
+    portfolio_positions = (
+        pd.concat(portfolio_rows, ignore_index=True)
+        if portfolio_rows
+        else pd.DataFrame(columns=["Dataset"] + required_cols)
     )
 
-if uploaded is not None:
+    # Only datasets that actually hold positions are aligned, so dates are not
+    # dropped needlessly. (One contributing dataset = its own full calendar.)
+    contributing = [r["Dataset"] for r in portfolio_sources if r["Positions included"] > 0]
+    contributing = contributing or list(portfolio_frames)
+    _seen = {}
+    for _name in contributing:
+        for _c in portfolio_frames[_name].columns:
+            if _c != "Date":
+                if _c in _seen:
+                    st.error(
+                        f"Series name '{_c}' appears in both {_seen[_c]} and {_name}; "
+                        "series names must be unique across datasets for the Overall Portfolio."
+                    )
+                    st.stop()
+                _seen[_c] = _name
+    df = portfolio_frames[contributing[0]]
+    for _name in contributing[1:]:
+        df = df.merge(portfolio_frames[_name], on="Date", how="inner")
+    df = df.sort_values("Date").reset_index(drop=True)
+    if df.empty:
+        st.error("The datasets share no common trading dates.")
+        st.stop()
+    portfolio_date_note = (
+        f"{len(df):,} common trading dates across "
+        + ", ".join(f"{n} ({len(portfolio_frames[n]):,})" for n in contributing)
+        + "."
+    )
+elif uploaded is not None:
     try:
         df = load_data(uploaded)
     except Exception as e:
@@ -130,11 +256,17 @@ with st.sidebar:
 # 1. Positions
 # ---------------------------------------------------------------------------
 st.header("1. Positions")
-st.caption(
-    "Add one row per position. Pick the fly from the dropdown, "
-    "set entry/stop and lot size. Lots can be negative for a short. "
-    "Use the ⋮ menu on a row, or the + at the bottom, to add / delete rows."
-)
+if IS_PORTFOLIO:
+    st.caption(
+        "Read-only roll-up of the positions in BRN D-Flies, CL/BZ Flybox and CL D-Flies. "
+        "Edit positions on each dataset's own page; they are picked up here automatically."
+    )
+else:
+    st.caption(
+        "Add one row per position. Pick the fly from the dropdown, "
+        "set entry/stop and lot size. Lots can be negative for a short. "
+        "Use the ⋮ menu on a row, or the + at the bottom, to add / delete rows."
+    )
 
 DEFAULT_POSITIONS = pd.DataFrame(
     [
@@ -149,175 +281,186 @@ DEFAULT_POSITIONS = pd.DataFrame(
     ]
 )
 
-# Keep position state completely separate for each dataset.
-# This is important on Streamlit because the same app session can switch
-# between BRN and CL/BZ without restarting the app.
-positions_seed_key = f"positions_seed_{dataset_id}"
-positions_editor_key = f"positions_editor_{dataset_id}"
-positions_upload_key = f"positions_csv_upload_{dataset_id}"
-last_loaded_sig_key = f"_last_loaded_positions_sig_{dataset_id}"
-saved_session_key = f"saved_positions_{dataset_id}"
-
-# Initialise this dataset's position state once. Priority is: 
-# 1) positions saved during the current Streamlit session,
-# 2) CSV already present beside app.py (works for local deployments),
-# 3) default position.
-if positions_seed_key not in st.session_state:
-    initial_positions = None
-
-    if saved_session_key in st.session_state:
-        initial_positions = st.session_state[saved_session_key].copy()
-    elif POSITIONS_FILE.exists():
-        try:
-            initial_positions = pd.read_csv(POSITIONS_FILE)
-            if "Fly" in initial_positions.columns:
-                initial_positions = initial_positions[
-                    initial_positions["Fly"].isin(fly_cols)
-                ].copy()
-        except Exception:
-            initial_positions = None
-
-    if initial_positions is None or initial_positions.empty:
-        initial_positions = DEFAULT_POSITIONS.copy()
-
-    st.session_state[positions_seed_key] = initial_positions
-
-edited = st.data_editor(
-    st.session_state[positions_seed_key],
-    num_rows="dynamic",
-    use_container_width=True,
-    column_config={
-        "Fly": st.column_config.SelectboxColumn(
-            dataset["fly_label"], options=fly_cols, required=True, default=fly_cols[0]
-        ),
-        "Entry": st.column_config.NumberColumn(
-            "Entry Price", step=0.01, format="%.3f", default=0.0
-        ),
-        "Stop": st.column_config.NumberColumn(
-            "Stop Price", step=0.01, format="%.3f", default=0.0
-        ),
-        "Lots (+long/-short)": st.column_config.NumberColumn(
-            "Lots (+long/-short)", step=1, default=1
-        ),
-        "Tick Size": st.column_config.NumberColumn(
-            "Tick Size", step=0.001, format="%.3f", default=0.01
-        ),
-        "Tick Value ($)": st.column_config.NumberColumn(
-            "Tick Value ($)", step=1.0, default=10.0
-        ),
-    },
-    key=positions_editor_key,
-)
-
-# --- Save / load positions (free, local — a CSV file next to the app) -----
-required_cols = ["Fly", "Entry", "Stop", "Lots (+long/-short)", "Tick Size", "Tick Value ($)"]
-
-with st.sidebar:
-    st.header("Save / Load Positions")
-
-    # IMPORTANT: keep a separate saved copy in Streamlit session state for
-    # each dataset. This means clicking Save for CL/BZ really persists the
-    # positions while the current app session is alive, even when Streamlit
-    # Cloud cannot persist files written to its temporary filesystem.
-    sv1, sv2 = st.columns(2)
-
-    if sv1.button("💾 Save", key=f"save_positions_{dataset_id}"):
-        saved_copy = edited.copy()
-        st.session_state[saved_session_key] = saved_copy
-        st.session_state[positions_seed_key] = saved_copy.copy()
-
-        # Also write a CSV when the environment permits it. This makes the
-        # same code work as expected when running locally. On Streamlit Cloud
-        # this file may disappear after a restart/redeploy, so the download
-        # button below is the permanent user-controlled copy.
-        try:
-            saved_copy.to_csv(POSITIONS_FILE, index=False)
-            disk_message = f" and wrote {POSITIONS_FILE.name}"
-        except Exception:
-            disk_message = ""
-
-        st.success(
-            f"Saved {len(saved_copy)} {selected_dataset} position(s) for this session"
-            f"{disk_message}."
+if IS_PORTFOLIO:
+    edited = portfolio_positions
+    with st.sidebar:
+        st.header("Positions")
+        st.caption(
+            "The Overall Portfolio is read-only. Edit, save or load positions on "
+            "each dataset's own page."
         )
+else:
+    # Keep position state completely separate for each dataset.
+    # This is important on Streamlit because the same app session can switch
+    # between BRN and CL/BZ without restarting the app.
+    positions_seed_key = f"positions_seed_{dataset_id}"
+    positions_editor_key = f"positions_editor_{dataset_id}"
+    positions_upload_key = f"positions_csv_upload_{dataset_id}"
+    last_loaded_sig_key = f"_last_loaded_positions_sig_{dataset_id}"
+    saved_session_key = f"saved_positions_{dataset_id}"
 
-    if sv2.button("🗑️ Clear saved", key=f"clear_positions_{dataset_id}"):
-        st.session_state.pop(saved_session_key, None)
-        st.session_state.pop(positions_seed_key, None)
-        try:
-            if POSITIONS_FILE.exists():
-                POSITIONS_FILE.unlink()
-        except Exception:
-            pass
-        if positions_editor_key in st.session_state:
-            del st.session_state[positions_editor_key]
-        st.success(f"Saved {selected_dataset} positions cleared.")
-        st.rerun()
+    # Initialise this dataset's position state once. Priority is: 
+    # 1) positions saved during the current Streamlit session,
+    # 2) CSV already present beside app.py (works for local deployments),
+    # 3) default position.
+    if positions_seed_key not in st.session_state:
+        initial_positions = None
 
-    # Give every dataset its own filename. This is the reliable way to keep
-    # positions permanently when the app is hosted on Streamlit Cloud.
-    download_name = (
-        "BRN_D_Flies_positions.csv"
-        if dataset_id == "brn_d_flies"
-        else "CL_D_Flies_positions.csv"
-        if dataset_id == "cl_d_flies"
-        else "CL_BZ_Flybox_positions.csv"
-    )
-
-    st.download_button(
-        "⬇️ Download positions as CSV",
-        data=edited.to_csv(index=False),
-        file_name=download_name,
-        mime="text/csv",
-        key=f"download_positions_{dataset_id}",
-        help=(
-            "Download the current positions. Keep this CSV as your permanent "
-            "backup and use Load positions to restore it later."
-        ),
-    )
-
-    upload = st.file_uploader(
-        "⬆️ Load positions from CSV", type=["csv"], key=positions_upload_key
-    )
-    if upload is not None:
-        file_sig = (upload.name, upload.size)
-        if st.session_state.get(last_loaded_sig_key) != file_sig:
+        if saved_session_key in st.session_state:
+            initial_positions = st.session_state[saved_session_key].copy()
+        elif POSITIONS_FILE.exists():
             try:
-                loaded_df = pd.read_csv(upload)
-                missing_cols = [c for c in required_cols if c not in loaded_df.columns]
-                bad_flies = (
-                    sorted(set(loaded_df["Fly"].dropna()) - set(fly_cols))
-                    if "Fly" in loaded_df.columns else []
-                )
-                if missing_cols:
-                    st.error(f"CSV is missing column(s): {', '.join(missing_cols)}")
-                else:
-                    if bad_flies:
-                        st.warning(
-                            f"Dropping row(s) with unrecognized fly name(s): "
-                            f"{', '.join(bad_flies)}"
-                        )
-                        loaded_df = loaded_df[loaded_df["Fly"].isin(fly_cols)]
-                    st.session_state[positions_seed_key] = loaded_df
-                    st.session_state[last_loaded_sig_key] = file_sig
-                    if positions_editor_key in st.session_state:
-                        del st.session_state[positions_editor_key]
-                    st.success(f"Loaded {len(loaded_df)} position(s).")
-                    st.rerun()
-            except Exception as e:
-                st.error(f"Couldn't read that CSV: {e}")
+                initial_positions = pd.read_csv(POSITIONS_FILE)
+                if "Fly" in initial_positions.columns:
+                    initial_positions = initial_positions[
+                        initial_positions["Fly"].isin(fly_cols)
+                    ].copy()
+            except Exception:
+                initial_positions = None
 
-    if saved_session_key in st.session_state:
-        st.caption(
-            f"✓ {selected_dataset} positions saved in the current app session."
+        if initial_positions is None or initial_positions.empty:
+            initial_positions = DEFAULT_POSITIONS.copy()
+
+        st.session_state[positions_seed_key] = initial_positions
+
+    edited = st.data_editor(
+        st.session_state[positions_seed_key],
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "Fly": st.column_config.SelectboxColumn(
+                dataset["fly_label"], options=fly_cols, required=True, default=fly_cols[0]
+            ),
+            "Entry": st.column_config.NumberColumn(
+                "Entry Price", step=0.01, format="%.3f", default=0.0
+            ),
+            "Stop": st.column_config.NumberColumn(
+                "Stop Price", step=0.01, format="%.3f", default=0.0
+            ),
+            "Lots (+long/-short)": st.column_config.NumberColumn(
+                "Lots (+long/-short)", step=1, default=1
+            ),
+            "Tick Size": st.column_config.NumberColumn(
+                "Tick Size", step=0.001, format="%.3f", default=0.01
+            ),
+            "Tick Value ($)": st.column_config.NumberColumn(
+                "Tick Value ($)", step=1.0, default=10.0
+            ),
+        },
+        key=positions_editor_key,
+    )
+
+    # Remember the latest positions shown for this dataset so the Overall Portfolio
+    # can pick them up (Streamlit drops editor state for pages that are not on screen).
+    st.session_state[f"live_positions_{dataset_id}"] = edited.copy()
+
+    # --- Save / load positions (free, local — a CSV file next to the app) -----
+    with st.sidebar:
+        st.header("Save / Load Positions")
+
+        # IMPORTANT: keep a separate saved copy in Streamlit session state for
+        # each dataset. This means clicking Save for CL/BZ really persists the
+        # positions while the current app session is alive, even when Streamlit
+        # Cloud cannot persist files written to its temporary filesystem.
+        sv1, sv2 = st.columns(2)
+
+        if sv1.button("💾 Save", key=f"save_positions_{dataset_id}"):
+            saved_copy = edited.copy()
+            st.session_state[saved_session_key] = saved_copy
+            st.session_state[positions_seed_key] = saved_copy.copy()
+
+            # Also write a CSV when the environment permits it. This makes the
+            # same code work as expected when running locally. On Streamlit Cloud
+            # this file may disappear after a restart/redeploy, so the download
+            # button below is the permanent user-controlled copy.
+            try:
+                saved_copy.to_csv(POSITIONS_FILE, index=False)
+                disk_message = f" and wrote {POSITIONS_FILE.name}"
+            except Exception:
+                disk_message = ""
+
+            st.success(
+                f"Saved {len(saved_copy)} {selected_dataset} position(s) for this session"
+                f"{disk_message}."
+            )
+
+        if sv2.button("🗑️ Clear saved", key=f"clear_positions_{dataset_id}"):
+            st.session_state.pop(saved_session_key, None)
+            st.session_state.pop(positions_seed_key, None)
+            try:
+                if POSITIONS_FILE.exists():
+                    POSITIONS_FILE.unlink()
+            except Exception:
+                pass
+            if positions_editor_key in st.session_state:
+                del st.session_state[positions_editor_key]
+            st.success(f"Saved {selected_dataset} positions cleared.")
+            st.rerun()
+
+        # Give every dataset its own filename. This is the reliable way to keep
+        # positions permanently when the app is hosted on Streamlit Cloud.
+        download_name = (
+            "BRN_D_Flies_positions.csv"
+            if dataset_id == "brn_d_flies"
+            else "CL_D_Flies_positions.csv"
+            if dataset_id == "cl_d_flies"
+            else "CL_BZ_Flybox_positions.csv"
         )
-    elif POSITIONS_FILE.exists():
-        st.caption(f"Loaded saved file on disk: {POSITIONS_FILE.name}")
-    else:
-        st.caption(
-            "No saved positions yet. Click Save to keep them in this session "
-            "or Download positions as CSV for permanent storage."
+
+        st.download_button(
+            "⬇️ Download positions as CSV",
+            data=edited.to_csv(index=False),
+            file_name=download_name,
+            mime="text/csv",
+            key=f"download_positions_{dataset_id}",
+            help=(
+                "Download the current positions. Keep this CSV as your permanent "
+                "backup and use Load positions to restore it later."
+            ),
         )
+
+        upload = st.file_uploader(
+            "⬆️ Load positions from CSV", type=["csv"], key=positions_upload_key
+        )
+        if upload is not None:
+            file_sig = (upload.name, upload.size)
+            if st.session_state.get(last_loaded_sig_key) != file_sig:
+                try:
+                    loaded_df = pd.read_csv(upload)
+                    missing_cols = [c for c in required_cols if c not in loaded_df.columns]
+                    bad_flies = (
+                        sorted(set(loaded_df["Fly"].dropna()) - set(fly_cols))
+                        if "Fly" in loaded_df.columns else []
+                    )
+                    if missing_cols:
+                        st.error(f"CSV is missing column(s): {', '.join(missing_cols)}")
+                    else:
+                        if bad_flies:
+                            st.warning(
+                                f"Dropping row(s) with unrecognized fly name(s): "
+                                f"{', '.join(bad_flies)}"
+                            )
+                            loaded_df = loaded_df[loaded_df["Fly"].isin(fly_cols)]
+                        st.session_state[positions_seed_key] = loaded_df
+                        st.session_state[last_loaded_sig_key] = file_sig
+                        if positions_editor_key in st.session_state:
+                            del st.session_state[positions_editor_key]
+                        st.success(f"Loaded {len(loaded_df)} position(s).")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Couldn't read that CSV: {e}")
+
+        if saved_session_key in st.session_state:
+            st.caption(
+                f"✓ {selected_dataset} positions saved in the current app session."
+            )
+        elif POSITIONS_FILE.exists():
+            st.caption(f"Loaded saved file on disk: {POSITIONS_FILE.name}")
+        else:
+            st.caption(
+                "No saved positions yet. Click Save to keep them in this session "
+                "or Download positions as CSV for permanent storage."
+            )
 
 positions = edited.dropna(subset=required_cols).copy()
 positions = positions[positions["Lots (+long/-short)"] != 0]
@@ -329,7 +472,14 @@ if incomplete > 0:
 
 
 if positions.empty:
-    st.info("Add at least one complete position above to see risk figures.")
+    if IS_PORTFOLIO:
+        st.info(
+            "No positions found in any dataset yet. Add positions on the BRN D-Flies, "
+            "CL/BZ Flybox or CL D-Flies page, then come back here."
+        )
+        st.dataframe(pd.DataFrame(portfolio_sources), use_container_width=True, hide_index=True)
+    else:
+        st.info("Add at least one complete position above to see risk figures.")
     st.stop()
 
 positions["SL Distance"] = (positions["Entry"] - positions["Stop"]).abs()
@@ -341,7 +491,8 @@ positions["$ Risk (abs)"] = positions["Signed $ Risk"].abs()
 
 st.dataframe(
     positions[
-        [
+        (["Dataset"] if IS_PORTFOLIO else [])
+        + [
             "Fly",
             "Entry",
             "Stop",
@@ -366,6 +517,32 @@ sum_abs_risk = positions["$ Risk (abs)"].sum()
 c1, c2 = st.columns(2)
 c1.metric("Total Stop-Loss Dollar Risk (undiversified)", f"${sum_abs_risk:,.0f}")
 c2.metric("Net Signed $ Exposure", f"${positions['Signed $ Risk'].sum():,.0f}")
+
+if IS_PORTFOLIO:
+    breakdown = (
+        positions.groupby("Dataset", sort=False)
+        .agg(
+            **{
+                "Positions": ("Fly", "count"),
+                "Undiversified $ Risk": ("$ Risk (abs)", "sum"),
+                "Net Signed $ Exposure": ("Signed $ Risk", "sum"),
+            }
+        )
+        .reset_index()
+        .merge(pd.DataFrame(portfolio_sources)[["Dataset", "Source"]], on="Dataset", how="left")
+    )
+    st.dataframe(
+        breakdown.style.format(
+            {"Undiversified $ Risk": "${:,.0f}", "Net Signed $ Exposure": "${:,.0f}"}
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.caption(
+        "Positions are taken from each dataset's page (editor as last viewed this "
+        "session, otherwise saved positions). Rows with Entry = Stop = 0 (the blank "
+        "starter row) are treated as unfilled and skipped. " + portfolio_date_note
+    )
 
 st.divider()
 
